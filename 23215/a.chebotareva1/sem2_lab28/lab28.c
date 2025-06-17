@@ -18,19 +18,21 @@ int create_connection(const char *host, int port) {
     }
 
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0){
+    if (sockfd < 0) {
         fprintf(stderr, "Error with socket\n");
         return EXIT_FAILURE;
     }
+
     struct sockaddr_in serv_addr = {0};
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(port);
     memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
 
-    if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0){
-        fprintf(stderr, "Error with connection\n");
+    if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        fprintf(stderr, "Error with socket\n");
         return EXIT_FAILURE;
     }
+
     return sockfd;
 }
 
@@ -52,28 +54,13 @@ void parse_url(const char *url, char *host, char *path) {
     }
 }
 
-void wait_for_space() {
-    printf("\nPress space to scroll down...\n");
-    fflush(stdout);
-
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(STDIN_FILENO, &readfds);
-
-    while (1) {
-        if (select(STDIN_FILENO + 1, &readfds, NULL, NULL, NULL) > 0) {
-            char ch;
-            read(STDIN_FILENO, &ch, 1);
-            if (ch == ' ') {
-                break;
-            }
-        }
-    }
+int max(int a, int b) {
+    return (a > b) ? a : b;
 }
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
-        fprintf(stderr, "Needed only 1 arg - url with \"http:\" beginning");
+        fprintf(stderr, "Usage: %s http://host/path\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -89,23 +76,53 @@ int main(int argc, char *argv[]) {
     send(sockfd, request, strlen(request), 0);
 
     char buffer[BUFFER_SIZE];
-    int line_count = 0;
     int in_headers = 1;
+    int line_count = 0;
+    int paused = 0;
+
     fd_set readfds;
+    char overflow[BUFFER_SIZE] = {0};  // для хранения "недопарсенной" строки
+    size_t overflow_len = 0;
+
     while (1) {
         FD_ZERO(&readfds);
-        FD_SET(sockfd, &readfds);
-        if (select(sockfd + 1, &readfds, NULL, NULL, NULL) <= 0) {
-            break;
+        if (!paused)
+            FD_SET(sockfd, &readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+
+        int maxfd = max(sockfd, STDIN_FILENO) + 1;
+        if (select(maxfd, &readfds, NULL, NULL, NULL) < 0) {
+            fprintf(stderr, "Error with socket\n");
+            return EXIT_FAILURE;
         }
-        if (FD_ISSET(sockfd, &readfds)) {
+
+        // пользователь нажал клавишу
+        if (FD_ISSET(STDIN_FILENO, &readfds)) {
+            char ch;
+            read(STDIN_FILENO, &ch, 1);
+            if (paused && ch == ' ') {
+                paused = 0;
+                line_count = 0;
+            }
+        }
+
+        // данные из сокета
+        if (!paused && FD_ISSET(sockfd, &readfds)) {
             int bytes = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
             if (bytes <= 0){
                 break;
             }
             buffer[bytes] = '\0';
-            char *line = strtok(buffer, "\n");
+            
+            // соединяем с остатком предыдущей строки (если был)
+            char combined[BUFFER_SIZE * 2];
+            snprintf(combined, sizeof(combined), "%s%s", overflow, buffer);
+            overflow[0] = '\0';
+            overflow_len = 0;
+
+            char *line = strtok(combined, "\n");
             while (line) {
+                // если заголовки ещё не пропущены
                 if (in_headers) {
                     if (strcmp(line, "\r") == 0 || strcmp(line, "") == 0)
                         in_headers = 0;
@@ -113,11 +130,18 @@ int main(int argc, char *argv[]) {
                     printf("%s\n", line);
                     line_count++;
                     if (line_count >= LINES_PER_SCREEN) {
-                        wait_for_space();
-                        line_count = 0;
+                        printf("\nPress space to scroll down...\n");
+                        fflush(stdout);
+                        paused = 1;
+                        break;
                     }
                 }
                 line = strtok(NULL, "\n");
+            }
+
+            if (line == NULL && buffer[bytes - 1] != '\n') {
+                strncpy(overflow, combined + strlen(combined), sizeof(overflow) - 1);
+                overflow[sizeof(overflow) - 1] = '\0';
             }
         }
     }
