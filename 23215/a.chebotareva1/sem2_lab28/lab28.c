@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
+#include <errno.h>
 
 #define BUFFER_SIZE 4096
 #define LINES_PER_SCREEN 25
@@ -47,7 +48,7 @@ int parse_url(const char *url, char *host, char *path) {
     const char *path_start = strchr(host_start, '/');
     const char *port_pos = strchr(host_start, ':');
 
-    if (port_pos - host_start > 256) {
+    if (port_pos && (port_pos - host_start > 256)) {
         fprintf(stderr, "Too long hostname!\n");
         exit(1);
     }
@@ -72,6 +73,7 @@ int max(int a, int b) {
 }
 
 int main(int argc, char *argv[]) {
+    int server_closed = 0;
     if (argc != 2) {
         fprintf(stderr, "Usage: %s http://host/path\n", argv[0]);
         return EXIT_FAILURE;
@@ -96,7 +98,7 @@ int main(int argc, char *argv[]) {
     char *overflow = calloc(1, 1);
     size_t overflow_len = 0;
 
-    while (1) {
+    while (!server_closed || overflow_len > 0 || paused) {
         if (!paused && overflow_len) {
             char *line = strtok(overflow, "\n");
             char *remaining = NULL;
@@ -127,15 +129,16 @@ int main(int argc, char *argv[]) {
         }
 
         FD_ZERO(&readfds);
-        FD_SET(sockfd, &readfds);
+        if (!server_closed) FD_SET(sockfd, &readfds);
         FD_SET(STDIN_FILENO, &readfds);
 
-        int maxfd = max(sockfd, STDIN_FILENO) + 1;
-        if (select(maxfd, &readfds, NULL, NULL, NULL) < 0) {
+        int maxfd = server_closed ? STDIN_FILENO : max(sockfd, STDIN_FILENO);
+        if (select(maxfd + 1, &readfds, NULL, NULL, NULL) < 0) {
             fprintf(stderr, "Error with select\n");
             free(overflow);
             return EXIT_FAILURE;
         }
+
 
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
             char ch;
@@ -174,9 +177,22 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (FD_ISSET(sockfd, &readfds)) {
+        if (!server_closed && (FD_ISSET(sockfd, &readfds))) {
             int bytes = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-            if (bytes <= 0) break;
+            if (bytes == 0) {
+                server_closed = 1;
+                continue;
+            }
+            if (bytes < 0) {
+                if (errno == ECONNRESET) {
+                    // Сервер сбросил соединение — считаем это концом передачи
+                    server_closed = 1;
+                } else {
+                    perror("Error with recv");
+                    free(overflow);
+                    return EXIT_FAILURE;
+                }
+            }
             buffer[bytes] = '\0';
 
             char *new_overflow = realloc(overflow, overflow_len + bytes + 1);
@@ -228,14 +244,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    int bytes = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-    if (bytes == 0) {
-        printf("\n\n\tConnection closed by server.\n");
-    } else if (bytes < 0) {
-        fprintf(stderr, "Error with recv\n");
-        free(overflow);
-        return EXIT_FAILURE;
-    }
+    printf("\n\n\tConnection closed by server.\n");
     printf("\tFinished receiving data. Exiting.\n\n");
 
     free(overflow);
