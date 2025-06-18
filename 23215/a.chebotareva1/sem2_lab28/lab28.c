@@ -97,9 +97,37 @@ int main(int argc, char *argv[]) {
     size_t overflow_len = 0;
 
     while (1) {
+        if (!paused && overflow_len) {
+            char *line = strtok(overflow, "\n");
+            char *remaining = NULL;
+            while (line) {
+                remaining = strtok(NULL, "\n");
+                if (in_headers) {
+                    if (strcmp(line, "\r") == 0 || strcmp(line, "") == 0)
+                        in_headers = 0;
+                } else {
+                    printf("%s\n", line);
+                    line_count++;
+                    if (line_count >= LINES_PER_SCREEN) {
+                        printf("\nPress space to scroll down...\n");
+                        fflush(stdout);
+                        paused = 1;
+                        break;
+                    }
+                }
+                line = remaining;
+            }
+            if (!paused) {
+                size_t rem_len = strlen(remaining ? remaining : "");
+                memmove(overflow, remaining ? remaining : "", rem_len + 1);
+                overflow_len = rem_len;
+                char *shr = realloc(overflow, overflow_len + 1);
+                if (shr) overflow = shr;
+            }
+        }
+
         FD_ZERO(&readfds);
-        if (!paused)
-            FD_SET(sockfd, &readfds);
+        FD_SET(sockfd, &readfds);
         FD_SET(STDIN_FILENO, &readfds);
 
         int maxfd = max(sockfd, STDIN_FILENO) + 1;
@@ -115,14 +143,40 @@ int main(int argc, char *argv[]) {
             if (paused && ch == ' ') {
                 paused = 0;
                 line_count = 0;
+                if (overflow_len && !paused) {
+                    char *line = strtok(overflow, "\n");
+                    char *remaining = NULL;
+                    while (line) {
+                        remaining = strtok(NULL, "\n");
+                        if (in_headers) {
+                            if (strcmp(line, "\r") == 0 || strcmp(line, "") == 0)
+                                in_headers = 0;
+                        } else {
+                            printf("%s\n", line);
+                            line_count++;
+                            if (line_count >= LINES_PER_SCREEN) {
+                                printf("\nPress space to scroll down...\n");
+                                fflush(stdout);
+                                paused = 1;
+                                break;
+                            }
+                        }
+                        line = remaining;
+                    }
+                    if (!paused) {
+                        size_t rem_len = strlen(remaining ? remaining : "");
+                        memmove(overflow, remaining ? remaining : "", rem_len + 1);
+                        overflow_len = rem_len;
+                        char *shr = realloc(overflow, overflow_len + 1);
+                        if (shr) overflow = shr;
+                    }
+                }
             }
         }
 
-        if (!paused && FD_ISSET(sockfd, &readfds)) {
+        if (FD_ISSET(sockfd, &readfds)) {
             int bytes = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-            if (bytes <= 0){
-                break;
-            }
+            if (bytes <= 0) break;
             buffer[bytes] = '\0';
 
             char *new_overflow = realloc(overflow, overflow_len + bytes + 1);
@@ -134,6 +188,7 @@ int main(int argc, char *argv[]) {
             overflow = new_overflow;
             memcpy(overflow + overflow_len, buffer, bytes + 1);
             overflow_len += bytes;
+            if (paused) continue;
 
             char *line = strtok(overflow, "\n");
             char *remaining = NULL;
