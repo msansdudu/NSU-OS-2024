@@ -36,22 +36,35 @@ int create_connection(const char *host, int port) {
     return sockfd;
 }
 
-void parse_url(const char *url, char *host, char *path) {
+int parse_url(const char *url, char *host, char *path) {
+    int port = 80;
     if (strncmp(url, "http://", 7) != 0) {
-        fprintf(stderr, "Only http:// URLs are supported\n");
+        fprintf(stderr, "Only http:// URLs are supported!\n");
         exit(1);
     }
 
     const char *host_start = url + 7;
     const char *path_start = strchr(host_start, '/');
-    if (path_start) {
+    const char *port_pos = strchr(host_start, ':');
+
+    if (port_pos - host_start > 256) {
+        fprintf(stderr, "Too long hostname!\n");
+        exit(1);
+    }
+
+    if (port_pos && (!path_start || port_pos < path_start)) {
+        strncpy(host, host_start, port_pos - host_start);
+        host[port_pos - host_start] = '\0';
+        port = atoi(port_pos + 1);
+    } else if (path_start) {
         strncpy(host, host_start, path_start - host_start);
         host[path_start - host_start] = '\0';
-        strcpy(path, path_start);
     } else {
         strcpy(host, host_start);
         strcpy(path, "/");
     }
+    printf("Port: %d\n", port);
+    return port;
 }
 
 int max(int a, int b) {
@@ -65,10 +78,9 @@ int main(int argc, char *argv[]) {
     }
 
     char host[256], path[1024];
-    parse_url(argv[1], host, path);
-    int sockfd = create_connection(host, 80);
+    int port = parse_url(argv[1], host, path);
+    int sockfd = create_connection(host, port);
 
-    // Отправка HTTP-запроса
     char request[2048];
     snprintf(request, sizeof(request),
              "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
@@ -81,7 +93,7 @@ int main(int argc, char *argv[]) {
     int paused = 0;
 
     fd_set readfds;
-    char overflow[BUFFER_SIZE] = {0};  // для хранения "недопарсенной" строки
+    char *overflow = calloc(1, 1);
     size_t overflow_len = 0;
 
     while (1) {
@@ -92,11 +104,11 @@ int main(int argc, char *argv[]) {
 
         int maxfd = max(sockfd, STDIN_FILENO) + 1;
         if (select(maxfd, &readfds, NULL, NULL, NULL) < 0) {
-            fprintf(stderr, "Error with socket\n");
+            fprintf(stderr, "Error with select\n");
+            free(overflow);
             return EXIT_FAILURE;
         }
 
-        // пользователь нажал клавишу
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
             char ch;
             read(STDIN_FILENO, &ch, 1);
@@ -106,23 +118,28 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // данные из сокета
         if (!paused && FD_ISSET(sockfd, &readfds)) {
             int bytes = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
             if (bytes <= 0){
                 break;
             }
             buffer[bytes] = '\0';
-            
-            // соединяем с остатком предыдущей строки (если был)
-            char combined[BUFFER_SIZE * 2];
-            snprintf(combined, sizeof(combined), "%s%s", overflow, buffer);
-            overflow[0] = '\0';
-            overflow_len = 0;
 
-            char *line = strtok(combined, "\n");
+            char *new_overflow = realloc(overflow, overflow_len + bytes + 1);
+            if (!new_overflow) {
+                fprintf(stderr, "Memory allocation error\n");
+                free(overflow);
+                return EXIT_FAILURE;
+            }
+            overflow = new_overflow;
+            memcpy(overflow + overflow_len, buffer, bytes + 1);
+            overflow_len += bytes;
+
+            char *line = strtok(overflow, "\n");
+            char *remaining = NULL;
             while (line) {
-                // если заголовки ещё не пропущены
+                remaining = strtok(NULL, "\n");
+
                 if (in_headers) {
                     if (strcmp(line, "\r") == 0 || strcmp(line, "") == 0)
                         in_headers = 0;
@@ -136,16 +153,37 @@ int main(int argc, char *argv[]) {
                         break;
                     }
                 }
-                line = strtok(NULL, "\n");
+                line = remaining;
             }
 
-            if (line == NULL && buffer[bytes - 1] != '\n') {
-                strncpy(overflow, combined + strlen(combined), sizeof(overflow) - 1);
-                overflow[sizeof(overflow) - 1] = '\0';
+            if (remaining || overflow[overflow_len - 1] != '\n') {
+                size_t rem_len = strlen(remaining ? remaining : "");
+                memmove(overflow, remaining ? remaining : "", rem_len + 1);
+                overflow_len = rem_len;
+                char *shrunk = realloc(overflow, overflow_len + 1);
+                if (shrunk) overflow = shrunk;
+            } else {
+                overflow[0] = '\0';
+                overflow_len = 0;
+                char *shrunk = realloc(overflow, 1);
+                if (shrunk) {
+                    overflow = shrunk;
+                }
             }
         }
     }
 
+    int bytes = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+    if (bytes == 0) {
+        printf("\n\n\tConnection closed by server.\n");
+    } else if (bytes < 0) {
+        fprintf(stderr, "Error with recv\n");
+        free(overflow);
+        return EXIT_FAILURE;
+    }
+    printf("\tFinished receiving data. Exiting.\n\n");
+
+    free(overflow);
     close(sockfd);
     return EXIT_SUCCESS;
 }
