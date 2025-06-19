@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #define BUFFER_SIZE 4096
 #define LINES_PER_SCREEN 25
@@ -22,13 +23,24 @@ int create_connection(const char *host, int port) {
     struct hostent *server = gethostbyname(host);
     if (!server) {
         fprintf(stderr, "No such host: %s\n", host);
-        return EXIT_FAILURE;
+        return -1;
     }
 
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
-        fprintf(stderr, "Error with socket\n");
-        return EXIT_FAILURE;
+        fprintf(stderr, "Error with socket: %s\n", strerror(errno));
+        return -1;
+    }
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags == -1) {
+        fprintf(stderr, "Error getting socket flags: %s\n", strerror(errno));
+        close(sockfd);
+        return -1;
+    }
+    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        fprintf(stderr, "Error setting non-blocking mode: %s\n", strerror(errno));
+        close(sockfd);
+        return -1;
     }
 
     struct sockaddr_in serv_addr = {0};
@@ -37,8 +49,30 @@ int create_connection(const char *host, int port) {
     memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
 
     if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        fprintf(stderr, "Error with socket\n");
-        return EXIT_FAILURE;
+        if (errno != EINPROGRESS) {
+            fprintf(stderr, "Error with connect: %s\n", strerror(errno));
+            close(sockfd);
+            return -1;
+        }
+        fd_set writefds;
+        FD_ZERO(&writefds);
+        FD_SET(sockfd, &writefds);
+        struct timeval timeout;
+        timeout.tv_sec = 3;
+        timeout.tv_usec = 0;
+        if (select(sockfd + 1, NULL, &writefds, NULL, &timeout) <= 0) {
+            fprintf(stderr, "Connection timed out or error: %s\n", strerror(errno));
+            close(sockfd);
+            return -1;
+        }
+        int so_error;
+        socklen_t len = sizeof(so_error);
+        getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len);
+        if (so_error != 0) {
+            fprintf(stderr, "Connection failed: %s\n", strerror(so_error));
+            close(sockfd);
+            return -1;
+        }
     }
 
     return sockfd;
@@ -56,8 +90,8 @@ int parse_url(const char *url, char *host, char *path) {
     const char *port_pos = strchr(host_start, ':');
 
     if ((port_pos && (port_pos - host_start > 256)) || ((path_start && !port_pos) && (path_start - host_start > 256))) {
-       fprintf(stderr, "Too long hostname!\n");
-       exit(1);
+        fprintf(stderr, "Too long hostname!\n");
+        exit(1);
     }
 
     if (port_pos && (!path_start || port_pos < path_start)) {
@@ -84,7 +118,7 @@ int max(int a, int b) {
 }
 
 void printing_lines(int *paused) {
-    if (print_offset >= data_size || *paused){
+    if (print_offset >= data_size || *paused) {
         return;
     }
     size_t i = print_offset;
@@ -95,11 +129,13 @@ void printing_lines(int *paused) {
         while (line_end < data_size && data_buffer[line_end] != '\n') {
             line_end++;
         }
-
-        fwrite(&data_buffer[i], 1, line_end - i + (line_end < data_size ? 1 : 0), stdout);
-        fflush(stdout);
-        lines_printed++;
-        line_count++;
+        size_t chars_to_print = line_end - i + (line_end < data_size ? 1 : 0);
+        if (chars_to_print > 0) {
+            fwrite(&data_buffer[i], 1, chars_to_print, stdout);
+            fflush(stdout);
+            lines_printed++;
+            line_count++;
+        }
 
         i = line_end + (line_end < data_size ? 1 : 0);
         print_offset = i;
@@ -151,6 +187,9 @@ int main(int argc, char *argv[]) {
     char host[256], path[1024];
     int port = parse_url(argv[1], host, path);
     int sockfd = create_connection(host, port);
+    if (sockfd < 0) {
+        return EXIT_FAILURE;
+    }
 
     char request[2048];
     snprintf(request, sizeof(request),
@@ -173,10 +212,21 @@ int main(int argc, char *argv[]) {
         FD_SET(sockfd, &readfds);
         FD_SET(STDIN_FILENO, &readfds);
 
+        struct timeval timeout;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 1000;
         int maxfd = max(sockfd, STDIN_FILENO) + 1;
-        if (select(maxfd, &readfds, NULL, NULL, NULL) < 0) {
-            fprintf(stderr, "Error with select\n");
+        int sel_res = select(maxfd, &readfds, NULL, NULL, &timeout);
+        if (sel_res < 0) {
+            fprintf(stderr, "Error with select: %s\n", strerror(errno));
+            close(sockfd);
             return EXIT_FAILURE;
+        }
+        if (sel_res == 0) {
+            if (!paused && data_size > print_offset) {
+                printing_lines(&paused);
+            }
+            continue;
         }
 
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
@@ -212,6 +262,7 @@ int main(int argc, char *argv[]) {
                 temp_buffer = realloc(temp_buffer, temp_capacity);
                 if (!temp_buffer) {
                     fprintf(stderr, "Memory allocation error\n");
+                    close(sockfd);
                     return EXIT_FAILURE;
                 }
             }
@@ -233,6 +284,7 @@ int main(int argc, char *argv[]) {
                                 data_buffer = realloc(data_buffer, data_capacity);
                                 if (!data_buffer) {
                                     fprintf(stderr, "Memory allocation error\n");
+                                    close(sockfd);
                                     return EXIT_FAILURE;
                                 }
                             }
@@ -253,6 +305,7 @@ int main(int argc, char *argv[]) {
                             data_buffer = realloc(data_buffer, data_capacity);
                             if (!data_buffer) {
                                 fprintf(stderr, "Memory allocation error\n");
+                                close(sockfd);
                                 return EXIT_FAILURE;
                             }
                         }
@@ -269,6 +322,7 @@ int main(int argc, char *argv[]) {
                     data_buffer = realloc(data_buffer, data_capacity);
                     if (!data_buffer) {
                         fprintf(stderr, "Memory allocation error\n");
+                        close(sockfd);
                         return EXIT_FAILURE;
                     }
                 }
