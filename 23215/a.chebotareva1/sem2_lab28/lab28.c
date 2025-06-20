@@ -57,10 +57,7 @@ int create_connection(const char *host, int port) {
         fd_set writefds;
         FD_ZERO(&writefds);
         FD_SET(sockfd, &writefds);
-        struct timeval timeout;
-        timeout.tv_sec = 3;
-        timeout.tv_usec = 0;
-        if (select(sockfd + 1, NULL, &writefds, NULL, &timeout) <= 0) {
+        if (select(sockfd + 1, NULL, &writefds, NULL, NULL) <= 0) {
             fprintf(stderr, "Connection timed out or error: %s\n", strerror(errno));
             close(sockfd);
             return -1;
@@ -212,11 +209,8 @@ int main(int argc, char *argv[]) {
         FD_SET(sockfd, &readfds);
         FD_SET(STDIN_FILENO, &readfds);
 
-        struct timeval timeout;
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 1000;
         int maxfd = max(sockfd, STDIN_FILENO) + 1;
-        int sel_res = select(maxfd, &readfds, NULL, NULL, &timeout);
+        int sel_res = select(maxfd, &readfds, NULL, NULL, NULL);
         if (sel_res < 0) {
             fprintf(stderr, "Error with select: %s\n", strerror(errno));
             close(sockfd);
